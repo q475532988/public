@@ -5,6 +5,10 @@ import cgi
 import argparse
 import urllib
 import ssl
+from influxdb import InfluxDBClient
+import datetime
+import functions_for_write_to_influxdb
+
 
 g_verbose   = False
 g_verbose_2 = False
@@ -14,35 +18,37 @@ g_logfile = str()
 # Default redirection to console
 redirect_to_file = sys.__stdout__
 
+#连接influxdb数据库
+client = InfluxDBClient(host='10.75.61.31', port=8086, username='root', password='root',database='wwl_telemetry')
+
 # Special function to redirect the output to console/file
 def print_log(*args):
-    print(*args, file=redirect_to_file)  #默认输出为console，可以重定向到文件
+    print(*args, file=redirect_to_file)
     redirect_to_file.flush()
 
 class S(BaseHTTPRequestHandler):
-    def _set_headers(self):   #所有的动作中都必须回复response code、发送headers、结束headers
+    def _set_headers(self):  
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
 
-    def do_GET(self):  #如果client没有get动作，这个方法可以不要
+    def do_GET(self):  
         self._set_headers()
         f = open("index.html", "r")
-        bys = f.read().encode()   #在python3中需要用bytes类型的
-        self.wfile.write(bys)   #发送数据到客户端使用wfile.write，读取数据用rfile.read
+        bys = f.read().encode()  
+        self.wfile.write(bys)   
 
-    def do_POST(self):   #telemetry吐数据用的是POST
+    def do_POST(self):  
         # Respond 200 OK
         self._set_headers()
         self.send_response(200)
         self.end_headers()
 
         # Process headers
-        (action, url, ver) = self.requestline.split()   #记住这里的requestline，没找到在哪里定义的这个变量
-        #print(action,url,ver)  #POST /network/show%20cdp%20neighbors HTTP/1.0
-        tm_http_ver  = self.headers.get('TM-HTTP-Version')  #这里在py3使用get方法，没有getheader
+        (action, url, ver) = self.requestline.split()  
+        tm_http_ver  = self.headers.get('TM-HTTP-Version')  
         tm_http_cnt  = self.headers.get('TM-HTTP-Content-Count')
-        ctype, pdict = cgi.parse_header(self.headers.get('content-type'))#返回两个值，第一个是Content-Type，第二个是其他的选项的键值对字典
+        ctype, pdict = cgi.parse_header(self.headers.get('content-type'))
         data_len     = int(self.headers['Content-Length'])
         print_log(">>> URL            :",  url)
         print_log(">>> TM-HTTP-VER    :",  tm_http_ver)
@@ -55,36 +61,32 @@ class S(BaseHTTPRequestHandler):
             dn_data = {};
 
             if ctype == 'multipart/form-data':
-                #读取表格形式的数据，fp,headers,environ定义如下
                 form = cgi.FieldStorage(
                         fp      = self.rfile,
                         headers = self.headers,
                         environ = {'REQUEST_METHOD':'POST',
                                    'CONTENT_TYPE':self.headers['Content-Type'],})
-                #form = cgi.parse_multipart(fp=self.rfile, pdict=pdict)   #此方法与如上相同，但此方法不能很好的支持大量数据，也没有如上方法安全
-                dn_list = form.keys()  #返回form表格中存储的值的键，这个值不是字典，但与字典类似，可用print(form)查看
-                #print(form)
+                dn_list = form.keys()  
                 if (g_verbose_2):
                     for dn in dn_list:
-                        dn_data[dn] = form.getlist(dn)#将key对应的值返回到一个list中，测试：会将值当成一整个字符串，所以list中也只有一个值
-                    #print(dn_data)  #这个dn_data中有两个值：sys/tm-connection-hello和show clock
+                        dn_data[dn] = form.getlist(dn)
+                    #print(dn_data) 
             else:
-                (root, nw, dn_raw) = url.split('/') #将/network/show%20cdp%20neighbors分割，第一个元素为空
+                (root, nw, dn_raw) = url.split('/') 
                 dn = urllib.parse.unquote(dn_raw)
                 dn_list.append(dn)
                 if (g_verbose_2):
                     data = self.rfile.read(int(self.headers['Content-Length']))
                     dn_data[dn] = [data]
-                    #print(dn_data)  #这个有一个值：show clock
+                    #print(dn_data) 
 
             # output
             for dn in dn_list:
+                body = {}
+                body["tags"] = {}
                 print_log("    Path => %s" % (dn))
+                body["measurement"] = dn
                 if g_verbose_2 or g_fulljson:
-                    #with open("json.txt", "w") as f:
-                    #    out = "%s" % (dn_data[dn])
-                    #    f.write(out)
-                    #print_log(dn_data[dn])
                     for payload in dn_data[dn]:
                         if ctype == 'multipart/form-data':
                             json_data = json.loads(payload, encoding='UTF-8')
@@ -93,25 +95,29 @@ class S(BaseHTTPRequestHandler):
                         if not json_data:
                             continue
                         print_log("            node_id_str   : %s" % (json_data['node_id_str']))
+                        body["tags"]["node_id_str"] = json_data['node_id_str']
                         print_log("            collection_id : %s" % (json_data['collection_id']))
+                        body["tags"]["collection_id"] = json_data['collection_id']
                         print_log("            data_source   : %s" % (json_data['data_source']))
+                        body["tags"]["data_source"] = json_data['data_source']
                         if g_fulljson:
                             print_log("            data          : ")
-                            print_log(json.dumps(json_data['data'], ensure_ascii=True, indent=2, sort_keys=True))
+                            result = functions_for_write_to_influxdb.fun_dict[body["measurement"]](json_data['data']) #按照show命令的不同整理fields字段的数据
+                            body["fields"] = result
+                            body["time"] = datetime.datetime.utcnow().isoformat("T")  
                             print_log("---------------------------------------------")
-
+                            client.write_points([body])
                         else:
                             print_log("            data          : %80.80s ..." % (json_data['data']))
 
         else:
-            #
             self.rfile.read(int(self.headers['Content-Length']))
 
         print_log("")
 
 def run(server_class=HTTPServer, handler_class=S, port=9000, certfile="", keyfile=""):
-    server_address = ('', port)  #ip位置为空表示本地
-    httpd = server_class(server_address, handler_class)  #参照文档这里为通用固定格式，HTTPServer可以直接使用，BaseHTTPRequestHandler则需要定义里面的所有方法，如do_GET()
+    server_address = ('', port) 
+    httpd = server_class(server_address, handler_class) 
     print_log('Starting httpd on port %d...' % (port))
     if (g_verbose == True):
         print_log('verbose      = True')
@@ -122,8 +128,8 @@ def run(server_class=HTTPServer, handler_class=S, port=9000, certfile="", keyfil
     if g_logfile:
         print_log("Redirect to file:{}".format(g_logfile))
     if certfile:
-        httpd.socket = ssl.wrap_socket(httpd.socket, certfile=certfile, keyfile=keyfile, server_side=True) #提供证书认证,每次更换receiver都要重新生成证书
-    httpd.serve_forever()  #不中断启动HTTP server监听端口，除非shutdown，所有http的动作都在自定义的BaseHTTPRequestHandler中完成，如get，post等等
+        httpd.socket = ssl.wrap_socket(httpd.socket, certfile=certfile, keyfile=keyfile, server_side=True) 
+    httpd.serve_forever()
 
 def parse_cmdline_arguments(cmd_args):
     '''
@@ -145,14 +151,14 @@ def parse_cmdline_arguments(cmd_args):
         args = cmd_args
 
     g_port      = args.port
-    g_verbose   = args.verbose  #控制是否读取头部内容中的show命令或者path路径
-    g_verbose_2 = args.more_verbose  #控制是否读取POST信息中的payload并显示部分设备基础信息
-    g_fulljson  = args.most_verbose #控制是否读取POST信息中的payload并显示部分设备基础信息和全部show命令的输出
+    g_verbose   = args.verbose  
+    g_verbose_2 = args.more_verbose  
+    g_fulljson  = args.most_verbose 
     g_cert      = args.certfile
     g_key       = args.keyfile
-    g_logfile   = args.logfile  #存储到receiver本地的文件的完整路径
+    g_logfile   = args.logfile  
 
-    #most_verbose如果设置为True则more_verbose和verbose都改为True，3个参数以此类推
+    
     if g_fulljson:
         g_verbose_2 = True
     if g_verbose_2:
@@ -161,12 +167,12 @@ def parse_cmdline_arguments(cmd_args):
 def main(cmd_args=list()):
     global redirect_to_file
 
-    parse_cmdline_arguments(cmd_args) #解析参数，如果没有参数传入则重新定义参数
+    parse_cmdline_arguments(cmd_args) 
     if g_logfile:
         redirect_to_file = open(g_logfile, "w+")
         sys.stderr = redirect_to_file
 
-    run(port=int(g_port), certfile=g_cert, keyfile=g_key)  #传递监听端口（交换机侧可以配置），证书和key
+    run(port=int(g_port), certfile=g_cert, keyfile=g_key)  
 
     if g_logfile:
         redirect_to_file.close()
